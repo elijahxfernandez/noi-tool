@@ -1,0 +1,23 @@
+[project]
+name = "massive-analyst-lab"
+version = "0.1.0"
+description = "Analyst training tools built on Massive market data: NYSE Order Imbalance (NOI) tool and Off-Exchange Flow tool"
+requires-python = ">=3.11"
+dependencies = [
+  "massive>=2.3.2",
+  "python-dotenv",
+  "numpy",
+  "pandas",
+  "matplotlib>=3.11.2",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
