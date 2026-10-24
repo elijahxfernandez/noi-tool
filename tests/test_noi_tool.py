@@ -81,3 +81,37 @@ def test_alerts_big_flip_drift_and_model():
     assert any(a.startswith("FLIP") for a in flip)
     drift = engine.check(_event("15:57:00", -8_000, price=104.0), "d")          # +400 bps vs prev close
     assert any(a.startswith("DRIFT") for a in drift)
+
+
+def test_reader_direction_convergence_magnitude():
+    from noi_tool.reader import ImbalanceReader
+
+    reader = ImbalanceReader(adv_lookup={"JPM": 1_000_000})
+
+    def ev(t_sec, imb, paired=50_000, symbol="JPM"):
+        return {"ts_ns": t_sec * 1_000_000_000, "time_et": "15:5X:XX.000", "symbol": symbol,
+                "auction_type": "C", "imbalance": imb, "paired": paired, "indicative_price": 100.0}
+
+    assert reader.direction(5_000) == "BUY"
+    assert reader.direction(-5_000) == "SELL"
+    assert reader.direction(0) == "FLAT"
+
+    # first event: nothing to compare to yet -> baseline is itself -> "steady"
+    line1 = reader.read(ev(0, 10_000))
+    assert "trend=steady" in line1 and "BUY" in line1
+
+    # imbalance grows within the 5-min window -> "growing"
+    line2 = reader.read(ev(60, 20_000))
+    assert "trend=growing" in line2
+
+    # imbalance shrinks back down, still within window of the first event -> "shrinking"
+    line3 = reader.read(ev(120, 5_000))
+    assert "trend=shrinking" in line3
+
+    # magnitude: 20,000 / 1,000,000 ADV = 2% -> "very large"
+    assert "very large" in line2
+
+    # a symbol with no ADV on record falls back to imbalance/paired ratio
+    reader2 = ImbalanceReader(adv_lookup={})
+    line = reader2.read(ev(0, 40_000, paired=20_000, symbol="ZZZ"))
+    assert "imb/paired" in line
