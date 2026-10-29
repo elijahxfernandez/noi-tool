@@ -61,11 +61,18 @@ def main():
     engine = None
     if args.alerts:
         from noi_tool.alerts import AlertEngine
-        from noi_tool.daily_bars import latest_reference
         from noi_tool.model import MODEL_PATH, Ridge
+        try:
+            from shared.market_reference import latest_reference as _ref_fn
+            reference = _ref_fn()  # has sigma20 + sector
+            reference_source = "shared.market_reference (free S&P 500 history, with volatility)"
+        except SystemExit:
+            from noi_tool.daily_bars import latest_reference as _ref_fn  # fallback: Massive REST daily bars
+            reference = _ref_fn()
+            reference_source = "noi_tool.daily_bars (Massive REST, no volatility)"
         model = Ridge.load(MODEL_PATH) if MODEL_PATH.exists() else None
-        engine = AlertEngine(latest_reference(), model, big_pct_adv=args.big_pct_adv)
-        print(f"Alerts on (model {'loaded' if model else 'not trained yet - score only'})")
+        engine = AlertEngine(reference, model, big_pct_adv=args.big_pct_adv)
+        print(f"Alerts on, reference: {reference_source} (model {'loaded' if model else 'not trained yet - score only'})")
 
     subs = [f"NOI.{t.upper()}" for t in args.ticker] if args.ticker else ["NOI.*"]
     client = WebSocketClient(api_key=api_key(), feed=Feed.RealTime, market=Market.Stocks, subscriptions=subs)

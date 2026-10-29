@@ -20,12 +20,39 @@ def signal_score(imbalance, adv20, imb_change):
     return direction * magnitude * convergence
 
 
-def event_features(row: dict, adv20: float, prev_close: float, imb_change: float) -> dict:
-    """Model features for one live NOI event (same definitions as dataset.build)."""
+# Y is the market-impact calibration constant from the square-root price-impact
+# model (Kyle's lambda / Almgren-Chriss literature): impact ~ Y * sigma * sqrt(Q/ADV).
+# Empirical studies typically find Y near 1; we default to 1 until Part B's reversal
+# test gives us real data to fit our own value from.
+IMPACT_Y = 1.0
+
+
+def expected_price_impact_bps(imbalance, adv20, sigma20, y: float = IMPACT_Y):
+    """Theory-grounded expected move, in basis points, from the square-root market-
+    impact model: impact = Y * sigma * sqrt(|imbalance| / ADV), signed by direction.
+
+        imbalance  signed order imbalance (shares)
+        adv20      20-day average daily volume (shares)      - how big ADV-wise
+        sigma20    20-day std dev of daily % returns          - this stock's normal swing size
+        y          calibration constant (see IMPACT_Y)
+
+    Unlike signal_score (an arbitrary 0-1 heuristic), this returns an actual
+    predicted price move: "this imbalance should move the price by about X bps,"
+    given the stock's usual volume and volatility. Requires sigma20 (from
+    shared.market_reference), not just ADV.
+    """
+    direction = np.sign(imbalance)
+    participation = np.abs(imbalance) / adv20
+    return direction * y * sigma20 * np.sqrt(participation) * 1e4
+
+
+def event_features(row: dict, adv20: float, prev_close: float, imb_change: float, sigma20: float | None = None) -> dict:
+    """Model features for one live NOI event (same definitions as dataset.build).
+    Pass sigma20 (from shared.market_reference) to also get expected_move_bps."""
     imb, price = row["imbalance"], row["indicative_price"]
     at = int(row["auction_time"])
     hh, mm = map(int, row["time_et"][:5].split(":"))
-    return {
+    feats = {
         "side": float(np.sign(imb)),
         "imb_adv": imb / adv20,
         "imb_paired": imb / max(row["paired"] + abs(imb), 1),
@@ -35,3 +62,6 @@ def event_features(row: dict, adv20: float, prev_close: float, imb_change: float
         "log_adv": float(np.log10(adv20)),
         "score": float(signal_score(imb, adv20, imb_change)),
     }
+    if sigma20 and sigma20 > 0:
+        feats["expected_move_bps"] = float(expected_price_impact_bps(imb, adv20, sigma20))
+    return feats

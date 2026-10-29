@@ -61,10 +61,14 @@ def fetch_history(symbols: list[str], years: int = 2, pause: float = 0.3) -> tup
     return ok, failed
 
 
-def load_combined(adv_window: int = 20) -> pd.DataFrame:
-    """All cached symbol histories, one row per (symbol, date), with ADV, previous
-    close, and sector/sub-industry joined in. Same shape as noi_tool.daily_bars.load()
-    so either source can feed the same downstream code."""
+def load_combined(adv_window: int = 20, vol_window: int = 20) -> pd.DataFrame:
+    """All cached symbol histories, one row per (symbol, date), with ADV, daily
+    volatility (sigma), previous close, and sector/sub-industry joined in. Same shape
+    as noi_tool.daily_bars.load() so either source can feed the same downstream code.
+
+    sigma = trailing std dev of daily % returns - the stock's own typical day-to-day
+    swing size, used by signal.expected_price_impact() alongside ADV (see its
+    docstring for the square-root price-impact model this feeds)."""
     if not DAILY_DIR.exists() or not any(DAILY_DIR.iterdir()):
         raise SystemExit(f"No cached history in {DAILY_DIR}. Run with --history first.")
     df = pd.concat(
@@ -74,10 +78,22 @@ def load_combined(adv_window: int = 20) -> pd.DataFrame:
     g = df.groupby("symbol")
     df["adv20"] = g["volume"].transform(lambda v: v.shift(1).rolling(adv_window, min_periods=10).mean())
     df["prev_close"] = g["close"].shift(1)
+    daily_return = g["close"].pct_change()
+    df["sigma20"] = daily_return.groupby(df["symbol"]).transform(
+        lambda r: r.shift(1).rolling(vol_window, min_periods=10).std()
+    )
     if CONSTITUENTS_PATH.exists():
         sectors = pd.read_csv(CONSTITUENTS_PATH)[["symbol", "sector", "sub_industry"]]
         df = df.merge(sectors, on="symbol", how="left")
     return df.reset_index(drop=True)
+
+
+def latest_reference(adv_window: int = 20, vol_window: int = 20) -> pd.DataFrame:
+    """For live use: per symbol, the most recent ADV, sigma, previous close and
+    sector. Same shape/role as noi_tool.daily_bars.latest_reference()."""
+    df = load_combined(adv_window, vol_window).sort_values(["symbol", "date"])
+    last = df.groupby("symbol").tail(1).set_index("symbol")
+    return last[["adv20", "sigma20", "prev_close", "sector", "sub_industry"]]
 
 
 def main():

@@ -115,3 +115,42 @@ def test_reader_direction_convergence_magnitude():
     reader2 = ImbalanceReader(adv_lookup={})
     line = reader2.read(ev(0, 40_000, paired=20_000, symbol="ZZZ"))
     assert "imb/paired" in line
+
+
+def test_expected_price_impact_square_root_scaling():
+    from noi_tool.signal import expected_price_impact_bps
+
+    adv, sigma = 1_000_000, 0.02  # 2% daily vol
+    small = expected_price_impact_bps(10_000, adv, sigma)
+    big = expected_price_impact_bps(40_000, adv, sigma)   # 4x the imbalance
+    sell = expected_price_impact_bps(-10_000, adv, sigma)
+
+    assert small > 0 and sell < 0 and np.isclose(small, -sell)          # sign follows direction
+    assert np.isclose(big, 2 * small)                                   # sqrt(4x) = 2x impact, not 4x
+    assert np.isclose(expected_price_impact_bps(0, adv, sigma), 0.0)
+
+
+def test_expected_price_impact_scales_with_volatility():
+    from noi_tool.signal import expected_price_impact_bps
+
+    calm = expected_price_impact_bps(10_000, 1_000_000, 0.01)
+    jumpy = expected_price_impact_bps(10_000, 1_000_000, 0.04)
+    assert np.isclose(jumpy, 4 * calm)  # linear in sigma, same imbalance/ADV
+
+
+def test_event_features_includes_expected_move_only_with_sigma():
+    from noi_tool.signal import event_features
+
+    row = {"imbalance": 20_000, "indicative_price": 100.0, "paired": 50_000,
+           "auction_time": 1600, "time_et": "15:55:00.000"}
+    with_sigma = event_features(row, adv20=1_000_000, prev_close=99.0, imb_change=0.0, sigma20=0.02)
+    without_sigma = event_features(row, adv20=1_000_000, prev_close=99.0, imb_change=0.0)
+    assert "expected_move_bps" in with_sigma
+    assert "expected_move_bps" not in without_sigma
+
+
+def test_reversal_test_reports_insufficient_data_with_no_capture():
+    from noi_tool.reversal_test import closing_imbalances
+    df = closing_imbalances()
+    # No collector has run yet in a fresh checkout - should be empty, not error
+    assert list(df.columns) == ["date", "symbol", "imbalance"]

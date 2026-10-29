@@ -20,10 +20,20 @@ import numpy as np
 import pandas as pd
 
 from noi_tool.dataset import FEATURES, LOOKBACK_MIN, NOI_DIR
-from noi_tool.daily_bars import latest_reference
 from noi_tool.model import MODEL_PATH, Ridge
 from noi_tool.signal import event_features
 from shared.config import DATA_DIR
+
+
+def _load_reference():
+    """Prefer the free S&P 500 history (has sigma20/volatility + sector); fall back
+    to Massive's REST daily bars (ADV + previous close only) if that's unavailable."""
+    try:
+        from shared.market_reference import latest_reference
+        return latest_reference()
+    except SystemExit:
+        from noi_tool.daily_bars import latest_reference
+        return latest_reference()
 
 PROFILE_PATH = DATA_DIR / "investor_profile.json"
 OLLAMA_URL = "http://localhost:11434/api/chat"
@@ -38,7 +48,10 @@ QUESTIONS = [
 SYSTEM_PROMPT = """You explain NYSE auction order-imbalance signals to an investor in plain English.
 Rules:
 - Use ONLY the numbers given. Do not invent prices, news, or history.
-- The predicted final price comes from a regression model; describe it as an estimate, not a certainty.
+- expected_move_bps (if present) comes from a market-impact formula (size and this stock's normal volatility),
+  not a trained model - describe it as a theory-based estimate, not a prediction or a certainty.
+- model_predicted_gap_bps (if present) comes from a regression model trained on past auctions; describe it
+  as a separate, statistically-fit estimate, not a certainty. Don't present the two as the same kind of number.
 - Explain what the imbalance direction, size vs. normal volume, and convergence mean for THIS stock right now.
 - Tailor it to the investor profile, especially the time horizon: an auction signal mostly affects today's
   closing/opening print and part of the move often reverses the next day, so for long horizons frame it as
@@ -85,11 +98,12 @@ def snapshot(symbol: str, date: str | None) -> tuple[dict, float]:
 
 
 def build_facts(symbol: str, row: dict, change: float) -> dict:
-    ref = latest_reference()
+    ref = _load_reference()
     if symbol not in ref.index:
         raise SystemExit(f"No daily bars for {symbol}. Fetch daily bars first.")
     adv, prev_close = ref.at[symbol, "adv20"], ref.at[symbol, "prev_close"]
-    feats = event_features(row, adv, prev_close, change)
+    sigma = ref.at[symbol, "sigma20"] if "sigma20" in ref.columns else None
+    feats = event_features(row, adv, prev_close, change, sigma)
     price = row["indicative_price"]
     facts = {
         "symbol": symbol, "date": row["date"], "time_et": row["time_et"],
@@ -101,6 +115,11 @@ def build_facts(symbol: str, row: dict, change: float) -> dict:
         "indicative_price": round(price, 2), "previous_close": round(prev_close, 2),
         "signal_score": round(feats["score"], 2),
     }
+    if "sector" in ref.columns and pd.notna(ref.at[symbol, "sector"]):
+        facts["sector"] = ref.at[symbol, "sector"]
+    if "expected_move_bps" in feats:
+        facts["expected_move_bps"] = round(feats["expected_move_bps"], 1)
+        facts["expected_move_note"] = "theory-based estimate (square-root price-impact model), not a guarantee"
     if MODEL_PATH.exists():
         pred_bps = float(Ridge.load(MODEL_PATH).predict(np.array([[feats[f] for f in FEATURES]]))[0])
         facts["model_predicted_gap_bps"] = round(pred_bps, 1)

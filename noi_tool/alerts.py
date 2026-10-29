@@ -16,16 +16,18 @@ import urllib.request
 from collections import defaultdict, deque
 
 import numpy as np
+import pandas as pd
 
 from noi_tool.dataset import FEATURES, LOOKBACK_MIN
-from noi_tool.signal import event_features, signal_score
+from noi_tool.signal import event_features, expected_price_impact_bps, signal_score
 
 AUCTION_LABELS = {"M": "Open", "C": "Close", "H": "Halt"}
 
 
 class AlertEngine:
     def __init__(self, reference, model=None, big_pct_adv=0.01, drift_bps=300, flip_after="15:55"):
-        self.ref = reference  # DataFrame indexed by symbol: adv20, prev_close
+        self.ref = reference  # DataFrame indexed by symbol: adv20, prev_close, optionally sigma20
+        self.has_sigma = "sigma20" in reference.columns
         self.model = model
         self.big_pct_adv = big_pct_adv
         self.drift_bps = drift_bps
@@ -50,6 +52,7 @@ class AlertEngine:
         if sym not in self.ref.index or not price:
             return []
         adv, prev_close = self.ref.at[sym, "adv20"], self.ref.at[sym, "prev_close"]
+        sigma = self.ref.at[sym, "sigma20"] if self.has_sigma else None
         change, previous = self._imb_change((sym, auction), row["ts_ns"], imb)
         score = float(signal_score(imb, adv, change))
         label = AUCTION_LABELS.get(auction, auction)
@@ -68,8 +71,11 @@ class AlertEngine:
         if not alerts:
             return []
         tail = f"  | score {score:+.2f}"
+        if sigma is not None and pd.notna(sigma) and sigma > 0:
+            impact = expected_price_impact_bps(imb, adv, sigma)
+            tail += f" | expected move ~{impact:+.0f} bps (sqrt-impact model, ${price * (1 + impact / 1e4):.2f})"
         if self.model is not None and row.get("auction_time"):
-            feats = event_features(row, adv, prev_close, change)
+            feats = event_features(row, adv, prev_close, change, sigma)
             pred = float(self.model.predict(np.array([[feats[f] for f in FEATURES]]))[0])
             tail += f" | model: final print {pred:+.1f} bps vs indicative (~${price * (1 + pred / 1e4):.2f})"
         alerts = [a + tail for a in alerts]
