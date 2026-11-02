@@ -10,13 +10,19 @@ a static snapshot for backtesting/context, not meant to be re-pulled every day.
 
 import argparse
 import time
+import os
+import warnings
+from pathlib import Path
+from datetime import datetime
+from shared.config import EASTERN
 
 import pandas as pd
 import yfinance as yf
 
 from shared.config import ROOT
 
-REF_DIR = ROOT / "reference_data"
+_external = ROOT.parent / "market-charts" / "reference_data"
+REF_DIR = Path(os.getenv("MARKET_CHARTS_REFERENCE_DIR", _external if _external.is_dir() else ROOT / "reference_data"))
 CONSTITUENTS_PATH = REF_DIR / "sp500_constituents.csv"
 DAILY_DIR = REF_DIR / "daily"
 WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -36,6 +42,8 @@ def fetch_constituents() -> pd.DataFrame:
 
 
 def fetch_history(symbols: list[str], years: int = 2, pause: float = 0.3) -> tuple[int, list[str]]:
+    if REF_DIR.resolve() != (ROOT / "reference_data").resolve():
+        raise SystemExit("External market-charts history is read-only here. Refresh it in its own project.")
     DAILY_DIR.mkdir(parents=True, exist_ok=True)
     ok, failed = 0, []
     for i, sym in enumerate(symbols, 1):
@@ -72,9 +80,11 @@ def load_combined(adv_window: int = 20, vol_window: int = 20) -> pd.DataFrame:
     if not DAILY_DIR.exists() or not any(DAILY_DIR.iterdir()):
         raise SystemExit(f"No cached history in {DAILY_DIR}. Run with --history first.")
     df = pd.concat(
-        [pd.read_csv(f).assign(symbol=f.stem) for f in DAILY_DIR.glob("*.csv")],
+        [pd.read_csv(f).assign(symbol=f.stem.upper().replace("-", ".")) for f in DAILY_DIR.glob("*.csv")],
         ignore_index=True,
-    ).sort_values(["symbol", "date"])
+    )
+    df["date"] = pd.to_datetime(df["date"], errors="raise").dt.strftime("%Y-%m-%d")
+    df = df.drop_duplicates(["symbol", "date"], keep="last").sort_values(["symbol", "date"])
     g = df.groupby("symbol")
     df["adv20"] = g["volume"].transform(lambda v: v.shift(1).rolling(adv_window, min_periods=10).mean())
     df["prev_close"] = g["close"].shift(1)
@@ -84,16 +94,32 @@ def load_combined(adv_window: int = 20, vol_window: int = 20) -> pd.DataFrame:
     )
     if CONSTITUENTS_PATH.exists():
         sectors = pd.read_csv(CONSTITUENTS_PATH)[["symbol", "sector", "sub_industry"]]
-        df = df.merge(sectors, on="symbol", how="left")
+        sectors["symbol"] = sectors["symbol"].str.upper().str.replace("-", ".", regex=False)
+        df = df.merge(sectors.drop_duplicates("symbol"), on="symbol", how="left", validate="many_to_one")
+    else:
+        df["sector"] = None
+        df["sub_industry"] = None
     return df.reset_index(drop=True)
 
 
 def latest_reference(adv_window: int = 20, vol_window: int = 20) -> pd.DataFrame:
     """For live use: per symbol, the most recent ADV, sigma, previous close and
     sector. Same shape/role as noi_tool.daily_bars.latest_reference()."""
-    df = load_combined(adv_window, vol_window).sort_values(["symbol", "date"])
+    df = load_combined(adv_window, vol_window)
+    today = datetime.now(EASTERN).strftime("%Y-%m-%d")
+    df = df[df["date"] < today].copy()  # never use a possibly unfinished current session
+    g = df.groupby("symbol")
+    df["adv20"] = g["volume"].transform(lambda v: v.rolling(adv_window, min_periods=10).mean())
+    returns = g["close"].pct_change(fill_method=None)
+    df["sigma20"] = returns.groupby(df["symbol"]).transform(lambda r: r.rolling(vol_window, min_periods=10).std())
+    df["prev_close"] = df["close"]
     last = df.groupby("symbol").tail(1).set_index("symbol")
-    return last[["adv20", "sigma20", "prev_close", "sector", "sub_industry"]]
+    if not last.empty:
+        oldest = pd.to_datetime(last["date"]).min()
+        if (pd.Timestamp(today) - oldest).days > 4:
+            warnings.warn("Historical reference is stale; refresh market-charts before interpreting live signals.", stacklevel=2)
+    return last[["adv20", "sigma20", "prev_close", "sector", "sub_industry", "date"]].rename(columns={"date": "reference_date"})
+
 
 
 def main():

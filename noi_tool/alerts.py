@@ -34,7 +34,7 @@ class AlertEngine:
         self.flip_after = flip_after
         self.history = defaultdict(deque)  # (symbol, auction) -> deque[(ts_ns, imbalance)]
         self.fired = set()
-        self.webhook = os.getenv("SLACK_WEBHOOK_URL")
+        self.webhook = None  # External delivery requires explicit opt-in; local alerts only.
 
     def _imb_change(self, key, ts_ns, imb):
         """Returns (convergence vs ~5 min ago, the previous event's imbalance)."""
@@ -52,8 +52,10 @@ class AlertEngine:
         if sym not in self.ref.index or not price:
             return []
         adv, prev_close = self.ref.at[sym, "adv20"], self.ref.at[sym, "prev_close"]
+        if not np.isfinite(adv) or adv <= 0 or not np.isfinite(prev_close) or prev_close <= 0:
+            return []
         sigma = self.ref.at[sym, "sigma20"] if self.has_sigma else None
-        change, previous = self._imb_change((sym, auction), row["ts_ns"], imb)
+        change, previous = self._imb_change((date, sym, auction), row["ts_ns"], imb)
         score = float(signal_score(imb, adv, change))
         label = AUCTION_LABELS.get(auction, auction)
         alerts = []
@@ -73,7 +75,7 @@ class AlertEngine:
         tail = f"  | score {score:+.2f}"
         if sigma is not None and pd.notna(sigma) and sigma > 0:
             impact = expected_price_impact_bps(imb, adv, sigma)
-            tail += f" | expected move ~{impact:+.0f} bps (sqrt-impact model, ${price * (1 + impact / 1e4):.2f})"
+            tail += f" | impact scale {impact:+.0f} bps (uncalibrated square-root heuristic)"
         if self.model is not None and row.get("auction_time"):
             feats = event_features(row, adv, prev_close, change, sigma)
             pred = float(self.model.predict(np.array([[feats[f] for f in FEATURES]]))[0])

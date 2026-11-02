@@ -39,7 +39,7 @@ class Ridge:
         n, p = Z.shape
 
         if method == "closed":
-            self.w = np.linalg.solve(Z.T @ Z + n * self.lam * np.eye(p), Z.T @ yc)
+            self.w = np.linalg.lstsq(Z.T @ Z + n * self.lam * np.eye(p), Z.T @ yc, rcond=None)[0]
         else:
             # Largest safe step = 1 / L, where L = max curvature of the loss = 2*eig_max(Z'Z/n) + 2*lam
             lr = lr or 1 / (2 * np.linalg.eigvalsh(Z.T @ Z / n)[-1] + 2 * self.lam)
@@ -64,6 +64,8 @@ class Ridge:
     @classmethod
     def load(cls, path):
         d = json.loads(path.read_text())
+        if d.get("features") != FEATURES:
+            raise ValueError("Model feature schema changed; rebuild the dataset and retrain.")
         m = cls(d["lam"])
         m.b, m.mu, m.sd, m.w = d["b"], np.array(d["mu"]), np.array(d["sd"]), np.array(d["w"])
         return m

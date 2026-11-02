@@ -95,7 +95,7 @@ def main():
 
     adv_lookup = {}
     try:
-        from noi_tool.daily_bars import latest_reference
+        from shared.market_reference import latest_reference
         adv_lookup = latest_reference()["adv20"].to_dict()
         print(f"ADV known for {len(adv_lookup)} symbols (scaled sizing on)")
     except SystemExit:

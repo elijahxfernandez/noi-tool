@@ -8,9 +8,18 @@ Run before the open (~9:00 ET) and leave it running through the close (~4:05 ET)
 
 import argparse
 import csv
+import json
+import os
+import atexit
+import asyncio
+import ssl
+import certifi
+from websockets.asyncio.client import connect
+from datetime import datetime
+from shared.config import EASTERN
 
 from massive import WebSocketClient
-from massive.websocket.models import Feed, Imbalance, Market
+from massive.websocket.models import Feed, Market
 
 from shared.config import DATA_DIR, api_key, ns_to_eastern
 
@@ -34,13 +43,14 @@ class DailyCsvWriter:
         if date != self.date:
             self.close()
             path = NOI_DIR / f"{date}.csv"
-            is_new = not path.exists()
+            is_new = not path.exists() or path.stat().st_size == 0
             self.file = open(path, "a", newline="")
             self.writer = csv.DictWriter(self.file, fieldnames=COLUMNS)
             if is_new:
                 self.writer.writeheader()
             self.date = date
         self.writer.writerow(row)
+        self.file.flush()
 
     def flush(self):
         if self.file:
@@ -58,10 +68,28 @@ def main():
     parser.add_argument("--big-pct-adv", type=float, default=0.01, help="BIG alert threshold as fraction of ADV")
     args = parser.parse_args()
 
+    # An OS lock prevents two collectors appending to the same data directory.
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(DATA_DIR / "collector.lock", "a+b")
+    if lock.tell() == 0:
+        lock.write(b"0")
+        lock.flush()
+    lock.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        raise SystemExit("A collector is already running for this data directory.")
+    atexit.register(lock.close)
+
     engine = None
     if args.alerts:
         from noi_tool.alerts import AlertEngine
-        from noi_tool.model import MODEL_PATH, Ridge
         try:
             from shared.market_reference import latest_reference as _ref_fn
             reference = _ref_fn()  # has sigma20 + sector
@@ -70,49 +98,109 @@ def main():
             from noi_tool.daily_bars import latest_reference as _ref_fn  # fallback: Massive REST daily bars
             reference = _ref_fn()
             reference_source = "noi_tool.daily_bars (Massive REST, no volatility)"
-        model = Ridge.load(MODEL_PATH) if MODEL_PATH.exists() else None
-        engine = AlertEngine(reference, model, big_pct_adv=args.big_pct_adv)
-        print(f"Alerts on, reference: {reference_source} (model {'loaded' if model else 'not trained yet - score only'})")
+        engine = AlertEngine(reference, None, big_pct_adv=args.big_pct_adv)
+        print(f"Alerts on, reference: {reference_source} (analyst rules only)")
 
     subs = [f"NOI.{t.upper()}" for t in args.ticker] if args.ticker else ["NOI.*"]
-    client = WebSocketClient(api_key=api_key(), feed=Feed.RealTime, market=Market.Stocks, subscriptions=subs)
     out = DailyCsvWriter()
     count = 0
 
+    last_state = "connecting"
+
+    def status(state):
+        nonlocal last_state
+        last_state = state
+        path = DATA_DIR / "collector_status.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"status": state, "events": count,
+                                  "updated": datetime.now(EASTERN).isoformat(), "pid": os.getpid()}))
+        tmp.replace(path)
+
     def handler(msgs):
         nonlocal count
-        for m in msgs:
-            if not isinstance(m, Imbalance) or not m.time_stamp:
+        previous_count = count
+        for m in json.loads(msgs):
+            if m.get("ev") == "status":
+                state = m.get("status", "unknown")
+                status(state)
+                print(f"Feed status: {state}", flush=True)
                 continue
-            ts = ns_to_eastern(m.time_stamp)
+            if m.get("ev") != "NOI" or not m.get("t"):
+                continue
+            ts = ns_to_eastern(m["t"])
             row = {
-                "ts_ns": m.time_stamp,
+                "ts_ns": m.get("t"),
                 "time_et": ts.strftime("%H:%M:%S.%f")[:-3],
-                "symbol": m.symbol,
-                "auction_type": m.auction_type,
-                "auction_time": m.auction_time,
-                "imbalance": m.imbalance_quantity or 0,
-                "paired": m.paired_quantity or 0,
-                "indicative_price": m.book_clearing_price,
-                "exchange_id": m.exchange_id,
-                "sequence": m.symbol_sequence,
+                "symbol": m.get("T"),
+                "auction_type": m.get("a"),
+                "auction_time": m.get("at"),
+                "imbalance": m.get("o"),
+                "paired": m.get("p"),
+                "indicative_price": m.get("b"),
+                "exchange_id": m.get("x"),
+                "sequence": m.get("i"),
             }
             date = ts.strftime("%Y-%m-%d")
             out.write(row, date)
-            if engine:
+            if engine and row["imbalance"] is not None and row["paired"] is not None:
                 engine.check(row, date)
             count += 1
+        if count != previous_count:
+            status("receiving")
         out.flush()
         print(f"\rlogged {count:,} NOI events", end="", flush=True)
 
+    async def stream():
+        context = ssl.create_default_context(cafile=certifi.where())
+        key = api_key()
+        while True:
+            try:
+                status("connecting")
+                async with connect("wss://socket.massive.com/stocks", ssl=context, open_timeout=20) as ws:
+                    greeting = json.loads(await ws.recv())
+                    if any(m.get("status") == "max_connections" for m in greeting):
+                        status("max_connections")
+                        print("Massive connection limit reached. Stop other streams and restart.", flush=True)
+                        return
+                    await ws.send(json.dumps({"action": "auth", "params": key}))
+                    auth = json.loads(await ws.recv())
+                    if not any(m.get("status") == "auth_success" for m in auth):
+                        status("max_connections" if any(m.get("status") == "max_connections" for m in auth) else "auth_failed")
+                        print("Feed authentication did not succeed; see dashboard status.", flush=True)
+                        return
+                    status("authenticated")
+                    await ws.send(json.dumps({"action": "subscribe", "params": ",".join(subs)}))
+                    while True:
+                        try:
+                            payload = await asyncio.wait_for(ws.recv(), timeout=20)
+                        except asyncio.TimeoutError:
+                            status(last_state)  # heartbeat while idle, preserving actual subscription state
+                            continue
+                        messages = json.loads(payload)
+                        rejected = next((m.get("status") for m in messages if m.get("status") in {"max_connections", "auth_failed", "not_authorized", "error"}), None)
+                        if rejected:
+                            status(rejected)
+                            print(f"Feed rejected connection/subscription: {rejected}", flush=True)
+                            return
+                        handler(payload)
+            except Exception as exc:
+                # Never log exception text that might contain credentials.
+                status("reconnecting")
+                print(f"Feed interrupted ({type(exc).__name__}); retrying in 10 seconds.", flush=True)
+                await asyncio.sleep(10)
+
     print(f"Collecting {', '.join(subs)} -> {NOI_DIR}  (Ctrl+C to stop)")
+    status("connecting")
     try:
-        client.run(handle_msg=handler)
+        asyncio.run(stream())
     except KeyboardInterrupt:
         pass
     finally:
+        if last_state not in {"max_connections", "auth_failed", "not_authorized", "error"}:
+            status("stopped")
         out.close()
         print(f"\nStopped. {count:,} events logged.")
+
 
 
 if __name__ == "__main__":

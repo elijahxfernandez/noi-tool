@@ -20,10 +20,7 @@ def signal_score(imbalance, adv20, imb_change):
     return direction * magnitude * convergence
 
 
-# Y is the market-impact calibration constant from the square-root price-impact
-# model (Kyle's lambda / Almgren-Chriss literature): impact ~ Y * sigma * sqrt(Q/ADV).
-# Empirical studies typically find Y near 1; we default to 1 until Part B's reversal
-# test gives us real data to fit our own value from.
+# Uncalibrated scale factor; auction imbalances are not executed metaorders.
 IMPACT_Y = 1.0
 
 
@@ -36,10 +33,8 @@ def expected_price_impact_bps(imbalance, adv20, sigma20, y: float = IMPACT_Y):
         sigma20    20-day std dev of daily % returns          - this stock's normal swing size
         y          calibration constant (see IMPACT_Y)
 
-    Unlike signal_score (an arbitrary 0-1 heuristic), this returns an actual
-    predicted price move: "this imbalance should move the price by about X bps,"
-    given the stock's usual volume and volatility. Requires sigma20 (from
-    shared.market_reference), not just ADV.
+    This is an uncalibrated impact scale, not a validated price forecast.
+    Auction imbalance is not executed order size; empirical validation is required.
     """
     direction = np.sign(imbalance)
     participation = np.abs(imbalance) / adv20
@@ -54,6 +49,7 @@ def event_features(row: dict, adv20: float, prev_close: float, imb_change: float
     hh, mm = map(int, row["time_et"][:5].split(":"))
     feats = {
         "side": float(np.sign(imb)),
+        "size_bucket": float(size_bucket(imb, adv20)),
         "imb_adv": imb / adv20,
         "imb_paired": imb / max(row["paired"] + abs(imb), 1),
         "imb_change": imb_change,
@@ -65,3 +61,8 @@ def event_features(row: dict, adv20: float, prev_close: float, imb_change: float
     if sigma20 and sigma20 > 0:
         feats["expected_move_bps"] = float(expected_price_impact_bps(imb, adv20, sigma20))
     return feats
+
+
+# Frozen ADV boundaries: small <0.1%, moderate <0.5%, large <2%, very large >=2%.
+def size_bucket(imbalance, adv20):
+    return np.searchsorted([0.001, 0.005, 0.02], np.abs(imbalance) / adv20, side="right")

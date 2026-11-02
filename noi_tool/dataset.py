@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from noi_tool.daily_bars import load as load_daily
-from noi_tool.signal import signal_score
+from noi_tool.signal import signal_score, size_bucket
 from shared.config import DATA_DIR
 
 NOI_DIR = DATA_DIR / "noi"
@@ -31,7 +31,7 @@ AUCTIONS = {
 LOOKBACK_MIN = 5  # convergence window
 
 FEATURES = [
-    "side", "imb_adv", "imb_paired", "imb_change",
+    "side", "size_bucket", "imb_adv", "imb_paired", "imb_change",
     "ind_vs_prev_bps", "minutes_left", "log_adv", "score",
 ]
 
@@ -90,6 +90,7 @@ def build(noi: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
 
     prev_abs = df["imbalance_before"].abs()
     df["side"] = np.sign(df["imbalance"])
+    df["size_bucket"] = size_bucket(df["imbalance"], df["adv20"])
     df["imb_adv"] = df["imbalance"] / df["adv20"]
     df["imb_paired"] = df["imbalance"] / (df["paired"] + df["imbalance"].abs()).replace(0, np.nan)
     df["imb_change"] = ((df["imbalance"].abs() - prev_abs) / (prev_abs + 1)).fillna(0).clip(-1, 1)
