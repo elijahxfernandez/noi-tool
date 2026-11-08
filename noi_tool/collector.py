@@ -153,21 +153,37 @@ def main():
     async def stream():
         context = ssl.create_default_context(cafile=certifi.where())
         key = api_key()
+        # max_connections means Massive hasn't released our last session yet (it
+        # takes a few seconds) - back off and retry instead of giving up, since the
+        # slot almost always frees up on its own. auth_failed/not_authorized stay
+        # fatal (wrong key, not a timing issue).
+        max_connections_retries = 0
         while True:
             try:
                 status("connecting")
                 async with connect("wss://socket.massive.com/stocks", ssl=context, open_timeout=20) as ws:
                     greeting = json.loads(await ws.recv())
                     if any(m.get("status") == "max_connections" for m in greeting):
+                        max_connections_retries += 1
                         status("max_connections")
-                        print("Massive connection limit reached. Stop other streams and restart.", flush=True)
-                        return
+                        wait = min(10 * max_connections_retries, 120)
+                        print(f"Massive connection limit reached; retrying in {wait}s.", flush=True)
+                        await asyncio.sleep(wait)
+                        continue
                     await ws.send(json.dumps({"action": "auth", "params": key}))
                     auth = json.loads(await ws.recv())
                     if not any(m.get("status") == "auth_success" for m in auth):
-                        status("max_connections" if any(m.get("status") == "max_connections" for m in auth) else "auth_failed")
+                        if any(m.get("status") == "max_connections" for m in auth):
+                            max_connections_retries += 1
+                            status("max_connections")
+                            wait = min(10 * max_connections_retries, 120)
+                            print(f"Massive connection limit reached; retrying in {wait}s.", flush=True)
+                            await asyncio.sleep(wait)
+                            continue
+                        status("auth_failed")
                         print("Feed authentication did not succeed; see dashboard status.", flush=True)
                         return
+                    max_connections_retries = 0
                     status("authenticated")
                     await ws.send(json.dumps({"action": "subscribe", "params": ",".join(subs)}))
                     while True:
@@ -178,6 +194,13 @@ def main():
                             continue
                         messages = json.loads(payload)
                         rejected = next((m.get("status") for m in messages if m.get("status") in {"max_connections", "auth_failed", "not_authorized", "error"}), None)
+                        if rejected == "max_connections":
+                            max_connections_retries += 1
+                            status("max_connections")
+                            wait = min(10 * max_connections_retries, 120)
+                            print(f"Feed dropped (max_connections); retrying in {wait}s.", flush=True)
+                            await asyncio.sleep(wait)
+                            break
                         if rejected:
                             status(rejected)
                             print(f"Feed rejected connection/subscription: {rejected}", flush=True)
