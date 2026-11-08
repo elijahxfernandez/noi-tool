@@ -5,7 +5,7 @@ Free historical data, committed as a static snapshot (not meant to be re-pulled 
 - **`sp500_constituents.csv`** — S&P 500 symbol, company name, GICS sector and sub-industry. Source: Wikipedia's [List of S&P 500 companies](https://en.wikipedia.org/wiki/List_of_S%26P_500_companies).
 - **`daily/<SYMBOL>.csv`** — 5 years of daily open/high/low/close/volume per symbol. Source: Yahoo Finance via `yfinance`.
 
-Pulled: 2026-10-23 · 503 symbols · 2021-10-25 to 2026-10-22
+Pulled: 2026-11-08 · 503 symbols · 2021-11-08 to 2026-11-06
 
 ## Refresh
 

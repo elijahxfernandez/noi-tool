@@ -11,17 +11,12 @@ import csv
 import json
 import os
 import atexit
-import asyncio
-import ssl
-import certifi
-from websockets.asyncio.client import connect
 from datetime import datetime
-from shared.config import EASTERN
 
 from massive import WebSocketClient
 from massive.websocket.models import Feed, Market
 
-from shared.config import DATA_DIR, api_key, ns_to_eastern
+from shared.config import DATA_DIR, EASTERN, api_key, ns_to_eastern
 
 NOI_DIR = DATA_DIR / "noi"
 COLUMNS = [
@@ -105,11 +100,7 @@ def main():
     out = DailyCsvWriter()
     count = 0
 
-    last_state = "connecting"
-
     def status(state):
-        nonlocal last_state
-        last_state = state
         path = DATA_DIR / "collector_status.json"
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"status": state, "events": count,
@@ -150,79 +141,74 @@ def main():
         out.flush()
         print(f"\rlogged {count:,} NOI events", end="", flush=True)
 
-    async def stream():
-        context = ssl.create_default_context(cafile=certifi.where())
-        key = api_key()
-        # max_connections means Massive hasn't released our last session yet (it
-        # takes a few seconds) - back off and retry instead of giving up, since the
-        # slot almost always frees up on its own. auth_failed/not_authorized stay
-        # fatal (wrong key, not a timing issue).
-        max_connections_retries = 0
-        while True:
-            try:
-                status("connecting")
-                async with connect("wss://socket.massive.com/stocks", ssl=context, open_timeout=20) as ws:
-                    greeting = json.loads(await ws.recv())
-                    if any(m.get("status") == "max_connections" for m in greeting):
-                        max_connections_retries += 1
-                        status("max_connections")
-                        wait = min(10 * max_connections_retries, 120)
-                        print(f"Massive connection limit reached; retrying in {wait}s.", flush=True)
-                        await asyncio.sleep(wait)
-                        continue
-                    await ws.send(json.dumps({"action": "auth", "params": key}))
-                    auth = json.loads(await ws.recv())
-                    if not any(m.get("status") == "auth_success" for m in auth):
-                        if any(m.get("status") == "max_connections" for m in auth):
-                            max_connections_retries += 1
-                            status("max_connections")
-                            wait = min(10 * max_connections_retries, 120)
-                            print(f"Massive connection limit reached; retrying in {wait}s.", flush=True)
-                            await asyncio.sleep(wait)
-                            continue
-                        status("auth_failed")
-                        print("Feed authentication did not succeed; see dashboard status.", flush=True)
-                        return
-                    max_connections_retries = 0
-                    status("authenticated")
-                    await ws.send(json.dumps({"action": "subscribe", "params": ",".join(subs)}))
-                    while True:
-                        try:
-                            payload = await asyncio.wait_for(ws.recv(), timeout=20)
-                        except asyncio.TimeoutError:
-                            status(last_state)  # heartbeat while idle, preserving actual subscription state
-                            continue
-                        messages = json.loads(payload)
-                        rejected = next((m.get("status") for m in messages if m.get("status") in {"max_connections", "auth_failed", "not_authorized", "error"}), None)
-                        if rejected == "max_connections":
-                            max_connections_retries += 1
-                            status("max_connections")
-                            wait = min(10 * max_connections_retries, 120)
-                            print(f"Feed dropped (max_connections); retrying in {wait}s.", flush=True)
-                            await asyncio.sleep(wait)
-                            break
-                        if rejected:
-                            status(rejected)
-                            print(f"Feed rejected connection/subscription: {rejected}", flush=True)
-                            return
-                        handler(payload)
-            except Exception as exc:
-                # Never log exception text that might contain credentials.
-                status("reconnecting")
-                print(f"Feed interrupted ({type(exc).__name__}); retrying in 10 seconds.", flush=True)
-                await asyncio.sleep(10)
+    # Documented client (see massive/websocket/__init__.py: WebSocketClient.connect):
+    # auths, subscribes, and reconnects itself on a dropped connection using the
+    # websockets library's own backoff - that backoff is exactly what a
+    # max_connections rejection needs (Massive takes a few seconds to release the
+    # previous session), so there's no reconnect logic to write by hand here.
+    # max_reconnects=None means "keep retrying forever" instead of giving up after 5.
+    client = WebSocketClient(
+        api_key=api_key(),
+        feed=Feed.RealTime,
+        market=Market.Stocks,
+        subscriptions=subs,
+        raw=True,  # hand handler() the raw JSON text, same shape it already parses
+        max_reconnects=None,
+    )
 
     print(f"Collecting {', '.join(subs)} -> {NOI_DIR}  (Ctrl+C to stop)")
     status("connecting")
     try:
-        asyncio.run(stream())
+        client.run(handler)
     except KeyboardInterrupt:
         pass
     finally:
-        if last_state not in {"max_connections", "auth_failed", "not_authorized", "error"}:
-            status("stopped")
+        status("stopped")
         out.close()
         print(f"\nStopped. {count:,} events logged.")
+
+    # --- Old hand-rolled raw-websockets version (replaced above with the
+    # documented massive.WebSocketClient) - kept for reference only, not used. ---
+    #
+    # async def stream():
+    #     context = ssl.create_default_context(cafile=certifi.where())
+    #     key = api_key()
+    #     while True:
+    #         try:
+    #             status("connecting")
+    #             async with connect("wss://socket.massive.com/stocks", ssl=context, open_timeout=20) as ws:
+    #                 greeting = json.loads(await ws.recv())
+    #                 if any(m.get("status") == "max_connections" for m in greeting):
+    #                     status("max_connections")
+    #                     print("Massive connection limit reached. Stop other streams and restart.", flush=True)
+    #                     return
+    #                 await ws.send(json.dumps({"action": "auth", "params": key}))
+    #                 auth = json.loads(await ws.recv())
+    #                 if not any(m.get("status") == "auth_success" for m in auth):
+    #                     status("max_connections" if any(m.get("status") == "max_connections" for m in auth) else "auth_failed")
+    #                     print("Feed authentication did not succeed; see dashboard status.", flush=True)
+    #                     return
+    #                 status("authenticated")
+    #                 await ws.send(json.dumps({"action": "subscribe", "params": ",".join(subs)}))
+    #                 while True:
+    #                     try:
+    #                         payload = await asyncio.wait_for(ws.recv(), timeout=20)
+    #                     except asyncio.TimeoutError:
+    #                         status(last_state)
+    #                         continue
+    #                     messages = json.loads(payload)
+    #                     rejected = next((m.get("status") for m in messages if m.get("status") in {"max_connections", "auth_failed", "not_authorized", "error"}), None)
+    #                     if rejected:
+    #                         status(rejected)
+    #                         print(f"Feed rejected connection/subscription: {rejected}", flush=True)
+    #                         return
+    #                     handler(payload)
+    #         except Exception as exc:
+    #             status("reconnecting")
+    #             print(f"Feed interrupted ({type(exc).__name__}); retrying in 10 seconds.", flush=True)
+    #             await asyncio.sleep(10)
+    #
+    # asyncio.run(stream())
 
 
 
