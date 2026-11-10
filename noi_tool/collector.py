@@ -11,6 +11,8 @@ import csv
 import json
 import os
 import atexit
+import time
+import traceback
 from datetime import datetime
 
 from massive import WebSocketClient
@@ -108,34 +110,46 @@ def main():
         tmp.replace(path)
 
     def handler(msgs):
+        # One malformed/unexpected message must not take down the whole feed -
+        # an uncaught exception here would propagate out of client.run() and
+        # kill the entire process (which is what happened on 2026-11-09: 18
+        # minutes of collection, then silence, with no log to explain why).
         nonlocal count
         previous_count = count
-        for m in json.loads(msgs):
-            if m.get("ev") == "status":
-                state = m.get("status", "unknown")
-                status(state)
-                print(f"Feed status: {state}", flush=True)
-                continue
-            if m.get("ev") != "NOI" or not m.get("t"):
-                continue
-            ts = ns_to_eastern(m["t"])
-            row = {
-                "ts_ns": m.get("t"),
-                "time_et": ts.strftime("%H:%M:%S.%f")[:-3],
-                "symbol": m.get("T"),
-                "auction_type": m.get("a"),
-                "auction_time": m.get("at"),
-                "imbalance": m.get("o"),
-                "paired": m.get("p"),
-                "indicative_price": m.get("b"),
-                "exchange_id": m.get("x"),
-                "sequence": m.get("i"),
-            }
-            date = ts.strftime("%Y-%m-%d")
-            out.write(row, date)
-            if engine and row["imbalance"] is not None and row["paired"] is not None:
-                engine.check(row, date)
-            count += 1
+        try:
+            parsed = json.loads(msgs)
+        except (ValueError, TypeError) as exc:
+            print(f"Skipped unparseable message batch ({type(exc).__name__}): {exc}", flush=True)
+            return
+        for m in parsed:
+            try:
+                if m.get("ev") == "status":
+                    state = m.get("status", "unknown")
+                    status(state)
+                    print(f"Feed status: {state}", flush=True)
+                    continue
+                if m.get("ev") != "NOI" or not m.get("t"):
+                    continue
+                ts = ns_to_eastern(m["t"])
+                row = {
+                    "ts_ns": m.get("t"),
+                    "time_et": ts.strftime("%H:%M:%S.%f")[:-3],
+                    "symbol": m.get("T"),
+                    "auction_type": m.get("a"),
+                    "auction_time": m.get("at"),
+                    "imbalance": m.get("o"),
+                    "paired": m.get("p"),
+                    "indicative_price": m.get("b"),
+                    "exchange_id": m.get("x"),
+                    "sequence": m.get("i"),
+                }
+                date = ts.strftime("%Y-%m-%d")
+                out.write(row, date)
+                if engine and row["imbalance"] is not None and row["paired"] is not None:
+                    engine.check(row, date)
+                count += 1
+            except Exception as exc:
+                print(f"Skipped one malformed message ({type(exc).__name__}): {exc}", flush=True)
         if count != previous_count:
             status("receiving")
         out.flush()
@@ -158,8 +172,22 @@ def main():
 
     print(f"Collecting {', '.join(subs)} -> {NOI_DIR}  (Ctrl+C to stop)")
     status("connecting")
+    # client.run() is documented to reconnect forever on a dropped connection
+    # (max_reconnects=None above) - but if something still escapes that (an SDK-
+    # internal exception, a hard network failure, etc.), restart the whole feed
+    # instead of exiting. A short backoff avoids a tight crash-loop; the scheduled
+    # task's own execution-time limit is still the outer stop for the day.
     try:
-        client.run(handler)
+        while True:
+            try:
+                client.run(handler)
+                break  # a clean return (e.g. after KeyboardInterrupt re-raise below) ends the loop
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                status("reconnecting")
+                print(f"\nFeed crashed, restarting in 15s:\n{traceback.format_exc()}", flush=True)
+                time.sleep(15)
     except KeyboardInterrupt:
         pass
     finally:
