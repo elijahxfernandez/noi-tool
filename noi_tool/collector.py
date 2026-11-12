@@ -103,11 +103,19 @@ def main():
     count = 0
 
     def status(state):
-        path = DATA_DIR / "collector_status.json"
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"status": state, "events": count,
-                                  "updated": datetime.now(EASTERN).isoformat(), "pid": os.getpid()}))
-        tmp.replace(path)
+        # collector_status.json lives in a OneDrive-synced folder, which
+        # intermittently locks the file mid-sync (WinError 5 / Access is
+        # denied on the atomic replace - seen in production on 2026-11-11).
+        # This file is cosmetic dashboard status, not data: skip this one
+        # update rather than letting it crash (and restart) the whole feed.
+        try:
+            path = DATA_DIR / "collector_status.json"
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"status": state, "events": count,
+                                      "updated": datetime.now(EASTERN).isoformat(), "pid": os.getpid()}))
+            tmp.replace(path)
+        except OSError as exc:
+            print(f"Status file update skipped ({type(exc).__name__}): {exc}", flush=True)
 
     def handler(msgs):
         # One malformed/unexpected message must not take down the whole feed -
